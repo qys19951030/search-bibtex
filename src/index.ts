@@ -105,3 +105,55 @@ export type {
 } from "./config.js";
 export type { SearchSource, SearchSourceRegistry, SourceBibtexContext, SourceSearchContext } from "./source.js";
 export type { SelectionEvent, SelectionState, SelectionMode } from "./selection.js";
+export {
+  deduplicatePaths,
+  parseManifestText,
+  resolveDirectoryInputs,
+  resolveManifestInputs
+} from "./batch-input.js";
+export type { BatchInputResolution } from "./batch-input.js";
+export {
+  SourceBudgetError,
+  SourceBudgetController,
+  createBudgetedRegistry
+} from "./source-budget.js";
+export type { SourceBudgetOptions, SourceBudgetStats } from "./source-budget.js";
+export {
+  WEAK_AUTHOR_THRESHOLD,
+  WEAK_TITLE_THRESHOLD,
+  candidatesDescribeSamePaper,
+  mergeBibliographicCandidates
+} from "./merge.js";
+export type { MergeOutcome, MergedBibliographicCandidate, MergedFieldName } from "./merge.js";
+export {
+  BatchPreflightError,
+  CitationKeyAllocator,
+  buildCitationKey,
+  hasParsableBibtexHeader,
+  rewriteBibtexEntryKey,
+  validateBatchOutputs
+} from "./citation-key.js";
+export {
+  AppendOnlyJournal,
+  DEFAULT_JOURNAL_FILE,
+  isTerminalHit,
+  readJournal,
+  resolveJournalPath
+} from "./journal.js";
+export type { JournalEntry, JournalEntryStatus, JournalState } from "./journal.js";
+export { createDefaultBatchInputProcessor, defaultBatchInputProcessor, runBatch, runSearchMergePipeline } from "./batch.js";
+export type {
+  BatchInputRecord,
+  BatchInputStatus,
+  BatchRunOptions,
+  BatchRunResult,
+  BatchSourceSummary,
+  BatchSummary,
+  DefaultProcessorOptions,
+  ProcessedBatchInput
+} from "./batch.js";
+export {
+  fetchBibtexForRankedCandidates,
+  searchSourceCandidates
+} from "./search.js";
+export type { SourceSearchStageResult } from "./search.js";

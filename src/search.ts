@@ -21,7 +21,7 @@ import type { FetchLike } from "./http.js";
 import { fetchJson, fetchText, toSourceError } from "./http.js";
 import { buildMetadataCandidate, generateSearchQueries, normalizeWhitespace, stripArxivVersion } from "./metadata.js";
 import { extractPdfDocumentSnapshot } from "./pdf.js";
-import { type BibliographicCandidate, rankBibliographicCandidates } from "./ranking.js";
+import { type BibliographicCandidate, type RankedBibliographicCandidate, rankBibliographicCandidates } from "./ranking.js";
 import type { SearchSource, SearchSourceRegistry, SourceSearchContext } from "./source.js";
 import type {
   PaperSource,
@@ -123,88 +123,120 @@ export async function searchBibtex(
   assertRegisteredSources(preferences.sourcePriority, sourceRegistry);
   const parallel = options.parallel ?? true;
   const timeoutMs = options.timeoutMs ?? defaultSearchTimeoutMs;
-  if (parallel) {
-    return await searchBibtexParallel(
-      metadata,
-      preferences,
-      generateSearchQueries(metadata),
-      options.fetcher ?? fetch,
-      options.onProgress,
-      timeoutMs,
-      sourceRegistry
-    );
-  }
-
   const queries = generateSearchQueries(metadata);
-  const timeout = createSearchTimeoutController(timeoutMs);
   const fetcher = options.fetcher ?? fetch;
-  const onProgress = options.onProgress;
-  const sourceErrors: SearchSourceError[] = [];
-  const candidates: BibliographicCandidate[] = [];
-  const completedSources: PaperSource[] = [];
-  const failedSources: PaperSource[] = [];
-  let timedOut = false;
 
-  try {
-    onProgress?.({
-      completed: 0,
-      total: preferences.sourcePriority.length,
-      completedSources: [],
-      failedSources: []
-    });
+  const searchStage = await executeSourceSearches(metadata, {
+    preferences,
+    queries,
+    fetcher,
+    onProgress: options.onProgress,
+    parallel,
+    timeoutMs,
+    sourceRegistry
+  });
 
-    for (const source of preferences.sourcePriority) {
-      try {
-        candidates.push(...await searchSource(source, sourceRegistry, { metadata, queries, fetcher, signal: timeout.signal, limit: preferences.limit }));
-        completedSources.push(source);
-      } catch (error) {
-        failedSources.push(source);
-        sourceErrors.push(toSourceError(source, queries[0]?.value ?? metadata.title ?? metadata.filePath, error));
-        if (isSearchTimeoutError(error)) {
-          timedOut = true;
-        }
-      }
-      onProgress?.({
-        completed: completedSources.length + failedSources.length,
-        total: preferences.sourcePriority.length,
-        completedSources: orderedSourceList(preferences.sourcePriority, completedSources),
-        failedSources: orderedSourceList(preferences.sourcePriority, failedSources)
-      });
-      if (timedOut) {
-        break;
-      }
-    }
+  const ranked = rankBibliographicCandidates(metadata, searchStage.candidates, preferences).slice(
+    0,
+    preferences.limit * 2
+  );
+  const { results, sourceErrors: bibtexErrors } = await fetchBibtexForRankedCandidates(ranked, {
+    sourceRegistry,
+    fetcher,
+    timeoutMs,
+    limit: preferences.limit
+  });
 
-    const ranked = rankBibliographicCandidates(metadata, candidates, preferences).slice(0, preferences.limit * 2);
-    const results: SearchResult[] = [];
+  return {
+    metadata,
+    queries,
+    results,
+    sourceErrors: [...searchStage.sourceErrors, ...bibtexErrors]
+  };
+}
 
-    if (!timedOut) {
-      for (const candidate of ranked) {
-        try {
-          const bibtex = await fetchBibtexForCandidate(candidate, sourceRegistry, fetcher, { signal: timeout.signal });
-          results.push({ ...candidate, bibtex });
-          if (results.length >= preferences.limit) {
-            break;
-          }
-        } catch (error) {
-          sourceErrors.push(toSourceError(candidate.source, candidate.title, error));
-          if (isSearchTimeoutError(error)) {
-            timedOut = true;
-            break;
-          }
-        }
-      }
-    }
+/**
+ * Candidate-level output of the source-search stage, before any BibTeX fetch.
+ * Reused by the batch pipeline so candidates can be merged across sources first.
+ */
+export interface SourceSearchStageResult {
+  queries: SearchQueryCandidate[];
+  candidates: BibliographicCandidate[];
+  sourceErrors: SearchSourceError[];
+}
 
-    return {
-      metadata,
-      queries,
-      results,
-      sourceErrors
-    };
-  } finally {
-    timeout.cleanup();
+/**
+ * Run only the source-query stage against every configured source and return the
+ * raw, unranked candidates plus normalized per-source errors.
+ *
+ * Honors the same parallel/serial and timeout semantics as {@link searchBibtex}.
+ *
+ * @param metadata - Metadata extracted from a PDF or built from a title.
+ * @param options  - Search configuration.
+ * @returns Raw candidates and source errors for the ranking/merge stages.
+ */
+export async function searchSourceCandidates(
+  metadata: PdfMetadataCandidate,
+  options: BibliographySearchOptions = {}
+): Promise<SourceSearchStageResult> {
+  const sourceRegistry = options.sourceRegistry ?? createSearchSourceRegistry(options.customSources);
+  const preferences = mergeSearchPreferences(options.preferences);
+  assertRegisteredSources(preferences.sourcePriority, sourceRegistry);
+  const parallel = options.parallel ?? true;
+  const timeoutMs = options.timeoutMs ?? defaultSearchTimeoutMs;
+
+  return await executeSourceSearches(metadata, {
+    preferences,
+    queries: generateSearchQueries(metadata),
+    fetcher: options.fetcher ?? fetch,
+    onProgress: options.onProgress,
+    parallel,
+    timeoutMs,
+    sourceRegistry
+  });
+}
+
+/**
+ * Fetch BibTeX text for an already-ranked candidate list, bounding every fetch
+ * with its own timeout and dropping (rather than failing on) candidates whose
+ * BibTeX cannot be resolved.
+ *
+ * @param ranked - Ranked candidates in preference order.
+ * @param options - Registry, fetcher, timeout and result limit.
+ * @returns Successfully fetched results (up to the limit) and per-candidate errors.
+ */
+export async function fetchBibtexForRankedCandidates(
+  ranked: RankedBibliographicCandidate[],
+  options: {
+    sourceRegistry: SearchSourceRegistry;
+    fetcher: FetchLike;
+    timeoutMs: number;
+    limit: number;
   }
+): Promise<{ results: SearchResult[]; sourceErrors: SearchSourceError[] }> {
+  const resultsByIndex: Array<SearchResult | undefined> = new Array(ranked.length);
+  const errorsByIndex: Array<SearchSourceError | undefined> = new Array(ranked.length);
+
+  await Promise.all(ranked.map(async (candidate, index) => {
+    const timeout = createSearchTimeoutController(options.timeoutMs);
+    try {
+      const bibtex = await fetchBibtexForCandidate(candidate, options.sourceRegistry, options.fetcher, {
+        signal: timeout.signal
+      });
+      resultsByIndex[index] = { ...candidate, bibtex };
+    } catch (error) {
+      errorsByIndex[index] = toSourceError(candidate.source, candidate.title, error);
+    } finally {
+      timeout.cleanup();
+    }
+  }));
+
+  return {
+    results: resultsByIndex
+      .filter((result): result is SearchResult => result !== undefined)
+      .slice(0, options.limit),
+    sourceErrors: errorsByIndex.filter((error): error is SearchSourceError => error !== undefined)
+  };
 }
 
 /**
@@ -261,6 +293,77 @@ export function createSearchSourceRegistry(customSources: CustomSourceConfig[] =
   return registry;
 }
 
+/**
+ * Execute the source-query stage in either parallel or serial mode, returning
+ * every raw candidate and normalized source error without ranking or fetching
+ * BibTeX. Serial mode retains its short-circuiting global timeout behavior.
+ */
+async function executeSourceSearches(
+  metadata: PdfMetadataCandidate,
+  options: {
+    preferences: SearchPreferences;
+    queries: SearchQueryCandidate[];
+    fetcher: FetchLike;
+    onProgress: BibliographySearchOptions["onProgress"];
+    parallel: boolean;
+    timeoutMs: number;
+    sourceRegistry: SearchSourceRegistry;
+  }
+): Promise<SourceSearchStageResult> {
+  const { preferences, queries, fetcher, onProgress, timeoutMs, sourceRegistry } = options;
+  if (options.parallel) {
+    return await searchBibtexParallel(metadata, preferences, queries, fetcher, onProgress, timeoutMs, sourceRegistry);
+  }
+
+  const timeout = createSearchTimeoutController(timeoutMs);
+  const sourceErrors: SearchSourceError[] = [];
+  const candidates: BibliographicCandidate[] = [];
+  const completedSources: PaperSource[] = [];
+  const failedSources: PaperSource[] = [];
+  let timedOut = false;
+
+  try {
+    onProgress?.({
+      completed: 0,
+      total: preferences.sourcePriority.length,
+      completedSources: [],
+      failedSources: []
+    });
+
+    for (const source of preferences.sourcePriority) {
+      try {
+        candidates.push(...await searchSource(source, sourceRegistry, {
+          metadata,
+          queries,
+          fetcher,
+          signal: timeout.signal,
+          limit: preferences.limit
+        }));
+        completedSources.push(source);
+      } catch (error) {
+        failedSources.push(source);
+        sourceErrors.push(toSourceError(source, queries[0]?.value ?? metadata.title ?? metadata.filePath, error));
+        if (isSearchTimeoutError(error)) {
+          timedOut = true;
+        }
+      }
+      onProgress?.({
+        completed: completedSources.length + failedSources.length,
+        total: preferences.sourcePriority.length,
+        completedSources: orderedSourceList(preferences.sourcePriority, completedSources),
+        failedSources: orderedSourceList(preferences.sourcePriority, failedSources)
+      });
+      if (timedOut) {
+        break;
+      }
+    }
+
+    return { queries, candidates, sourceErrors };
+  } finally {
+    timeout.cleanup();
+  }
+}
+
 async function searchBibtexParallel(
   metadata: PdfMetadataCandidate,
   preferences: SearchPreferences,
@@ -269,7 +372,7 @@ async function searchBibtexParallel(
   onProgress: BibliographySearchOptions["onProgress"],
   timeoutMs: number,
   sourceRegistry: SearchSourceRegistry
-): Promise<SearchResponse> {
+): Promise<SourceSearchStageResult> {
   const candidatesBySource: Array<BibliographicCandidate[] | undefined> = new Array(preferences.sourcePriority.length);
   const sourceErrorsBySource: Array<SearchSourceError | undefined> = new Array(preferences.sourcePriority.length);
   const completedSources: PaperSource[] = [];
@@ -311,31 +414,10 @@ async function searchBibtexParallel(
     }
   }));
 
-  const candidates = candidatesBySource.flatMap((value) => value ?? []);
-  const ranked = rankBibliographicCandidates(metadata, candidates, preferences).slice(0, preferences.limit * 2);
-  const resultsByIndex: Array<SearchResult | undefined> = new Array(ranked.length);
-  const bibtexErrorsByIndex: Array<SearchSourceError | undefined> = new Array(ranked.length);
-
-  await Promise.all(ranked.map(async (candidate, index) => {
-    const timeout = createSearchTimeoutController(timeoutMs);
-    try {
-      const bibtex = await fetchBibtexForCandidate(candidate, sourceRegistry, fetcher, { signal: timeout.signal });
-      resultsByIndex[index] = { ...candidate, bibtex };
-    } catch (error) {
-      bibtexErrorsByIndex[index] = toSourceError(candidate.source, candidate.title, error);
-    } finally {
-      timeout.cleanup();
-    }
-  }));
-
   return {
-    metadata,
     queries,
-    results: resultsByIndex.filter((result): result is SearchResult => result !== undefined).slice(0, preferences.limit),
-    sourceErrors: [
-      ...sourceErrorsBySource.filter((error): error is SearchSourceError => error !== undefined),
-      ...bibtexErrorsByIndex.filter((error): error is SearchSourceError => error !== undefined)
-    ]
+    candidates: candidatesBySource.flatMap((value) => value ?? []),
+    sourceErrors: sourceErrorsBySource.filter((error): error is SearchSourceError => error !== undefined)
   };
 }
 

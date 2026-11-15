@@ -11,6 +11,7 @@
 import type { FetchLike, FetchRequestOptions } from "./http.js";
 import { fetchText } from "./http.js";
 import { normalizeWhitespace, stripArxivVersion } from "./metadata.js";
+import { buildCitationKey } from "./citation-key.js";
 import type { SearchResult } from "./types.js";
 
 /**
@@ -108,7 +109,7 @@ export function generateBibtex(record: BibtexRecord): string {
     fields.push(`  url = {${record.url}}`);
   }
 
-  return `@${record.arxivId ? "article" : "misc"}{${citationKey(record)},\n${fields.join(",\n")}\n}`;
+  return `@${record.arxivId ? "article" : "misc"}{${buildCitationKey(record)},\n${fields.join(",\n")}\n}`;
 }
 
 /**
@@ -146,13 +147,6 @@ export function formatBibtexText(value: string): string {
   }
   lines.push("}");
   return lines.join("\n");
-}
-
-function citationKey(record: BibtexRecord): string {
-  const firstAuthor = record.authors[0]?.split(/\s+/).at(-1) ?? "paper";
-  const firstTitleWord = record.title.match(/[A-Za-z0-9]+/)?.[0] ?? "work";
-  const year = record.year ? String(record.year) : "nd";
-  return `${firstAuthor}${year}${firstTitleWord}`.replace(/[^A-Za-z0-9:_-]/g, "");
 }
 
 function escapeBibtexValue(value: string): string {

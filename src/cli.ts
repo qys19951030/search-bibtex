@@ -9,7 +9,7 @@
  * @module cli
  */
 import { Command } from "commander";
-import { writeFile } from "node:fs/promises";
+import { stat, writeFile } from "node:fs/promises";
 
 import {
   KEEP_CURRENT_SELECTION_SOURCE,
@@ -17,6 +17,12 @@ import {
   type BibtexRefinementProgressEvent,
   type BibtexRefinementSelectionContext
 } from "./bibtex-file.js";
+import {
+  deduplicatePaths,
+  resolveDirectoryInputs,
+  resolveManifestInputs
+} from "./batch-input.js";
+import { runBatch } from "./batch.js";
 import {
   defaultConfigToml,
   defaultSearchPreferences,
@@ -350,6 +356,72 @@ export function createProgram(): Command {
       }
     });
 
+  program
+    .command("batch")
+    .description("Process a directory of PDFs or a path manifest, merging cross-source candidates and appending to one .bib with resumable journaling.")
+    .argument("<input>", "Directory of PDFs or a manifest file with one path per line ('#' comments and blank lines ignored).")
+    .requiredOption("-o, --output <path>", "Destination BibTeX file; entries are appended without overwriting existing keys.")
+    .requiredOption("--result-dir <path>", "Directory for the append-only result journal and run state.")
+    .option("-c, --config <path>", "Path to a config.toml file.")
+    .option("-p, --pages <count>", "Number of leading pages to inspect.", parsePositiveInteger, 2)
+    .option("-l, --limit <count>", "Maximum ranked BibTeX candidates per input.", parsePositiveInteger)
+    .option(
+      "--source-priority <sources>",
+      "Comma-separated source priority, e.g. dblp,arxiv,crossref,openalex,doi."
+    )
+    .option(
+      "--weights <weights>",
+      "Comma-separated scoring weights, e.g. title=0.5,author=0.2,year=0.1,identifier=0.15,source=0.05."
+    )
+    .option("--parallel", "Search sources in parallel.")
+    .option("--no-parallel", "Search sources serially.")
+    .option("-t, --timeout <seconds>", "Maximum per-source request duration in seconds.", parsePositiveInteger)
+    .option(
+      "--source-concurrency <count>",
+      "Maximum concurrent in-flight calls per source across the batch.",
+      parsePositiveInteger,
+      2
+    )
+    .option(
+      "--source-budget <seconds>",
+      "Total wall-clock budget in seconds available to each source.",
+      parsePositiveInteger,
+      120
+    )
+    .option(
+      "--failure-threshold <count>",
+      "Consecutive failures before a source is skipped for the rest of the batch.",
+      parsePositiveInteger,
+      3
+    )
+    .option("--summary <path>", "Also write the JSON batch summary to this path.")
+    .action(async (input: string, options: BatchCommandOptions) => {
+      const config = await loadResolvedAppConfig({ configPath: options.config });
+      const inputs = await resolveBatchInputs(input);
+      const result = await runBatch({
+        inputs,
+        bibPath: options.output,
+        resultDir: options.resultDir,
+        budget: {
+          perSourceConcurrency: options.sourceConcurrency,
+          perSourceBudgetMs: options.sourceBudget * 1000,
+          failureThreshold: options.failureThreshold
+        },
+        searchOptions: {
+          pages: options.pages,
+          parallel: options.parallel ?? config.search.parallel,
+          timeoutMs: (options.timeout ?? config.search.timeoutSeconds) * 1000,
+          preferences: buildSearchPreferences(options, config),
+          customSources: config.sources
+        }
+      });
+
+      if (options.summary) {
+        await writeFile(options.summary, `${JSON.stringify(result, null, 2)}\n`);
+      }
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    });
+
   return program;
 }
 
@@ -437,6 +509,34 @@ interface TitleSearchCommandOptions extends SearchExecutionOptions {
   delimiter: string;
   download?: boolean;
   downloadDir?: string;
+}
+
+interface BatchCommandOptions extends SearchExecutionOptions {
+  output: string;
+  resultDir: string;
+  pages: number;
+  sourceConcurrency: number;
+  sourceBudget: number;
+  failureThreshold: number;
+  summary?: string;
+}
+
+/**
+ * Resolve a batch input argument into de-duplicated ordered paths.
+ *
+ * A directory contributes its immediate PDF files in filename order; any other
+ * existing path is treated as a manifest. Duplicates collapse to one
+ * processing slot while their occurrence count is retained for the summary.
+ *
+ * @param input - Directory path or manifest file path.
+ * @returns Unique ordered paths and the collapsed duplicate count.
+ */
+export async function resolveBatchInputs(input: string) {
+  const info = await stat(input);
+  const paths = info.isDirectory()
+    ? await resolveDirectoryInputs(input)
+    : await resolveManifestInputs(input);
+  return deduplicatePaths(paths);
 }
 
 /**

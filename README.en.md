@@ -106,6 +106,23 @@ Full reference: [Configuration](docs/CONFIGURATION.md) and [中文配置文档](
 | `select <pdf>` | Search and choose interactively, or print one candidate with `--select-index`. |
 | `search-title [titles...]` | Search from title strings or stdin. |
 | `update <bibtex>` | Refresh existing `.bib` entries while preserving citation keys. |
+| `batch <input>` | Process a directory or path manifest, merge cross-source candidates, assign collision-free keys, and persist a resumable journal plus summary. |
+
+### Batch processing (`batch`)
+
+`batch` takes either a **directory** (its `*.pdf` files are processed in filename order) or a **manifest file** (one path per line; blank lines and `#` comments are ignored). Repeated paths within one run are processed once, with repeats counted in the summary.
+
+```bash
+search-bibtex batch ./papers -o refs.bib --result-dir ./batch-state
+search-bibtex batch papers.txt -o refs.bib --result-dir ./batch-state --summary summary.json
+```
+
+- **Source budgets**: sources may query concurrently, but each source is bounded by `--source-concurrency`, `--source-budget` (total wall-clock) and `--failure-threshold` (circuit breaker). A slow or persistently failing source degrades to absent and is counted in the summary instead of failing a file.
+- **Cross-source merging**: candidates sharing a DOI or arXiv ID are treated as the same paper; weakly identified candidates merge only when titles and authors are highly similar and years do not conflict. The merged record keeps the field-richest data, lists contributing sources and per-field provenance, and retains its ranking score.
+- **Key collisions**: keys are derived deterministically from the first author surname, year and first title word; collisions get predictable `-1`, `-2`, ... suffixes and never overwrite existing entries.
+- **Resumable journaling**: each processed input appends one JSONL line to `--result-dir/batch-results.jsonl` (chunked, line-atomic). Re-runs skip prior hits (counted separately) and retry misses/failures; a torn final line is tolerated.
+- **Preflight first**: an unwritable `.bib`, a non-directory result path, or an unparsable existing `.bib` fail before any network request, never leaving a half-written file.
+- **One-to-one output**: the number of BibTeX entries written equals the number of `hit` records in the JSON summary.
 
 Interactive selector keys:
 

@@ -167,6 +167,28 @@ source = 0.05
 | `select <pdf>` | 搜索后交互选择，或用 `--select-index` 输出指定候选。 |
 | `search-title [titles...]` | 从标题字符串或 stdin 搜索候选。 |
 | `update <bibtex>` | 刷新现有 `.bib` 文件条目并保留 citation key。 |
+| `batch <input>` | 批量处理一个目录或路径清单，跨源合并候选、分配无冲突 key，并落盘可续跑的结果集与汇总。 |
+
+### 批量处理（`batch`）
+
+`batch` 接收一个**目录**（按文件名顺序处理其中的 `*.pdf`）或**清单文件**（一行一个路径，空行与 `#` 开头的注释行被忽略）。同一次运行里重复的路径只处理一次，重复条数计入汇总。
+
+```bash
+# 处理整个目录
+search-bibtex batch ./papers -o refs.bib --result-dir ./batch-state
+
+# 处理清单
+search-bibtex batch papers.txt -o refs.bib --result-dir ./batch-state --summary summary.json
+```
+
+关键行为：
+
+- **源预算**：各源可并发查询，但单源受 `--source-concurrency`（并发上限）、`--source-budget`（总耗时预算）和 `--failure-threshold`（连续失败熔断）约束；变慢或持续失败的源降级为缺席并在汇总计数，不会让单个文件失败。错误归一仍只走 `http.ts` 的 `toSourceError`。
+- **跨源合并**：DOI / arXiv 号相同的候选视为同一篇；仅有弱标识时，要求标题与作者高度接近且年份不冲突才合并。合并保留字段最全的记录，并在结果里列出命中来源与逐字段出处，同时保留排序分数。
+- **键冲突**：citation key 由第一作者姓、年份、标题首词固定生成；同键按 `-1`、`-2` …… 可预测区分，绝不覆盖已有条目。
+- **增量续跑**：每个输入处理完即向 `--result-dir/batch-results.jsonl` 追加一行（JSONL，分块追加、行级原子）。重跑时已命中的输入跳过（单独统计），未命中与失败的重新处理；末尾残行可容错。
+- **预检先行**：目标 `.bib` 不可写、结果目录不是目录、已有 `.bib` 无法解析，都会在发起任何检索前直接失败，不会留下写了一半的文件。
+- **一一对应**：写入 `.bib` 的条目数与 JSON 汇总里 `hit` 记录数严格相等。
 
 交互选择器键位：
 
